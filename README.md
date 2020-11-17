@@ -10,5 +10,6 @@ Differentially abundant proteins in mated females formed a highly interconnected
 
 We compared mating influences on the oocyte proteome with eisting data on decrease in translational efficiency (Greenblatt et al. 2019) changes in oocyte proteome during maturation (stage 11 to stage 14; Kronja et al. 2014a), activation (Kronja et al. 2014b), and changes during activation of phosphorylated proteins (Zhang et al. 2019).
 
-This repository includes all data and code necessary to replicate the analyses reproted in the manuscript. 
+This repository includes all data and code necessary to replicate the analyses reproted in the manuscript.
+The code is found in "Analysis_code.rmd" and the oocyte proteome data is "P473_100619_Proteins.txt" all other files are for comparisons to other datasets.
 For any qestions contact Caitlin at mcdonouce@gmail.com
