@@ -1,0 +1,881 @@
+---
+title: "FemaleMatingStatus_OocyteComposition"
+output: html_notebook
+---
+
+Load in (my) commonly used packages
+```{r}
+library(dplyr)
+library(tidyr)
+library(gplots)
+library(RColorBrewer)
+library(psych)
+library(tibble)
+library(eulerr)
+
+library(ggbiplot)
+
+library(geneplotter)
+library(ggplot2)
+library(UpSetR)
+library(ggrepel)
+
+library(limma)
+library(MSnbase)
+
+#BiocManager::install("clusterProfiler")
+#BiocManager::install("org.Dm.eg.db")
+
+library(clusterProfiler)
+library(org.Dm.eg.db)
+
+
+fromList <- function (input) {
+  # Same as original fromList()...
+  elements <- unique(unlist(input))
+  data <- unlist(lapply(input, function(x) {
+      x <- as.vector(match(elements, x))
+      }))
+  data[is.na(data)] <- as.integer(0)
+  data[data != 0] <- as.integer(1)
+  data <- data.frame(matrix(data, ncol = length(input), byrow = F))
+  data <- data[which(rowSums(data) != 0), ]
+  names(data) <- names(input)
+  # ... Except now it conserves your original value names!
+  row.names(data) <- elements
+  return(data)
+}
+```
+
+Read in mascot data & subset for high quality (confidence = high, 2 unique, and 2 peptides)
+The output of this step is the abundance estimate data included in Table S1
+```{r}
+egg.mascot <- read.table("P473_100619_Proteins.txt", header=T, fill=T, sep="\t") #5407
+
+#remove any contaminant protein matches
+egg.mascot <- egg.mascot %>% filter(!grepl('cRAP', Accession)) #5391
+
+#Make sure it has High confidence in combined and for ID in each sample
+egg.mascot <- subset(egg.mascot, egg.mascot$Protein.FDR.Confidence.Combined == "High") #4782
+egg.mascot <- subset(egg.mascot, egg.mascot$Found.in.Sample.in.S1.F1.127N.Sample.1.unmated == "High" & egg.mascot$Found.in.Sample.in.S2.F1.128N.Sample.2.unmated == "High" & egg.mascot$Found.in.Sample.in.S4.F1.129C.Sample.3.unmated == "High" & egg.mascot$Found.in.Sample.in.S3.F1.129N.Sample.1.mated == "High" & egg.mascot$Found.in.Sample.in.S5.F1.130N.Sample.2.mated == "High" & egg.mascot$Found.in.Sample.in.S6.F1.130C.Sample.3.mated == "High") #4762
+
+#Unique peptides & number of peptides >= 2
+egg.mascot <- subset(egg.mascot, egg.mascot$Number.of.Unique.Peptides >= 2 & egg.mascot$Number.of.Peptides >= 2) #4485
+
+```
+
+Read in data of all proteins identified in the proteomes of other studies for comparison.
+These studies reported protein names in varioius ways from different genome updates - I've used a couple of methods to try and get these to the most recent FBgn
+```{r}
+Kronja2014.DAVID <- read.table("EggActivatedProteomics.WT.names.Converted.DAVID.txt", header=T, fill=T, sep="\t")
+Kronja2014.DAVID <- as.character(Kronja2014.DAVID$To)
+
+Kronja2014.FlyBase <- read.table("EggActivatedProteomics.WT.names.Converted.FlyBase_full.txt", header=T, fill=T, sep="\t")
+Kronja2014.FlyBase<- as.character(Kronja2014.FlyBase$validated_id)
+
+Kronja2014.Identified <- unique(c(Kronja2014.DAVID, Kronja2014.FlyBase))
+Kronja2014.Identified <- grep("FBgn",Kronja2014.Identified, value = TRUE)
+
+Kronja2015.DAVID <- read.table("Eggmat.Kronja2015.UPoriginal.DAVIDconvert.txt", header = T, fill = T, sep="\t")
+Kronja2015.DAVID <- as.character(Kronja2015.DAVID$To)
+  
+Kronja2015.FlyBase1 <- read.table("Eggmat.Kronja2015.UPoriginal.FBconvert.txt", header = T, fill = T, sep="\t")
+Kronja2015.FlyBase1 <- as.character(Kronja2015.FlyBase1$validated_id)
+
+Kronja2015.FlyBase2 <- read.table("Eggmat.Kronja2015.CG.FBconvert.txt", header = T, fill = T, sep="\t")
+Kronja2015.FlyBase2 <- as.character(Kronja2015.FlyBase2$validated_id)
+Kronja2015.FlyBase2.full <- read.table("Eggmat.Kronja2015.CG.FBconvert.txt", header = T, fill = T, sep="\t")
+
+Kronja2015.Identified <- unique(c(Kronja2015.DAVID, Kronja2015.FlyBase1, Kronja2015.FlyBase2))
+Kronja2015.Identified <- grep("FBgn", Kronja2015.Identified, value=T)
+
+Zhang.Flybase <- read.table("ZhangWolfner.ProteinList.Converted.txt")
+```
+
+Compare my proteome to the previous proteomes to see how well they overlap - It's about 88% which is not bad!
+```{r}
+length(which(egg.mascot$Accession %in% Kronja2014.Identified)) #3984
+length(which(egg.mascot$Accession %in% Kronja2014.Identified)) / length(egg.mascot$Accession) #0.8882
+
+length(which(egg.mascot$Accession %in% Kronja2015.Identified)) #3924
+length(which(egg.mascot$Accession %in% Kronja2015.Identified)) / length(egg.mascot$Accession) #0.8749
+
+length(which(egg.mascot$Accession %in% Zhang.Flybase$V1))
+length(which(egg.mascot$Accession %in% Zhang.Flybase$V1))/length(egg.mascot$Accession) #90.14493
+
+(0.882943 + 0.8749164 + 0.9014493)/3 #0.8864362
+
+```
+
+Normalize data and look at relationships among samples with PCA, MDS and heirarchical clustering of correlations
+```{r}
+f <- egg.mascot
+e <- c(19, 20,22,21,23,24)
+row.names(f) <- f$Accession
+x <- readMSnSet2(f, e, sep = "\t")
+
+Sample<-gsub("Abundance\\.F1\\.\\d*[C|N]?\\.Sample\\.(\\d)\\.(\\w*)", "\\2.\\1", colnames(exprs(x)))
+tmp <- data.frame(do.call(rbind, strsplit(Sample, "[.]")))
+names(tmp) <- c("Sample","Replicate")
+
+sampleNames(x)<-paste(tmp$Sample, tmp$Replicate, sep = "")
+rownames(tmp) <- paste(tmp$Sample, tmp$Replicate, sep = "")
+pData(x) <- tmp
+
+x <- log(x, 2)
+x <- normalise(x,"diff.median")
+
+pca <- prcomp(t(exprs(x)))
+std_dev <- pca$sdev
+pr_var <- std_dev^2
+prop_varex <- data.frame(pr_var/sum(pr_var))
+plot(pca, type="l")
+
+#tiff('Egg.Mascot.Norm.tiff', units="in", width=4, height=6, res=300)
+ggbiplot(pca, obs.scale=1, var.axes = F, choice=1:2)+
+  geom_point(shape=21, cex=5,bg=c(rep("#eaa221", 3), rep("purple", 3)), col="black")+
+  theme_classic ()
+#dev.off()
+
+plotMDS(exprs(x), dim=c(1,2), bg=c(rep("#eaa221", 3), rep("purple", 3)), pch=21, cex=2)
+
+boxplot(exprs(x))
+
+data = as.matrix(exprs(x))
+sample_cor = cor(data, method='pearson', use='pairwise.complete.obs')
+sample_dist = as.dist(1-sample_cor)
+hc_samples = hclust(sample_dist, method='complete')
+
+my_sample_col <- data.frame(Name = c("unmated_1", "unmated_2", "unmated_3", "mated_1", "mated_2", "mated_3"))
+row.names(my_sample_col) <- colnames(x)
+
+
+#tiff('test.tiff', units="in", width=6.5, height=6.5, res=300)
+heatmap.2(sample_cor, 
+          dendrogram='both', 
+          Rowv=as.dendrogram(hc_samples), 
+          Colv=as.dendrogram(hc_samples), 
+          scale='none', 
+          symm=TRUE, 
+          density.info='none', 
+          col = brewer.pal(9,"Greys"), 
+          trace='none', 
+          ColSideColors = c(rep("#eaa221", 3), rep("purple", 3)),
+          RowSideColors = c(rep("#eaa221", 3), rep("purple", 3)),
+          labRow = c( "unmated_1", "unmated_2", "unmated_3", "mated_1", "mated_2", "mated_3"),
+          labCol = c("unmated_1", "unmated_2", "unmated_3", "mated_1", "mated_2", "mated_3"),
+          cexCol=0.9, cexRow=0.9, 
+          key=T, key.xlab = "Correlation Coeficient", 
+          key.ylab = "", key.title="Correlation Coeficient")  
+#dev.off()
+```
+
+Analyze differential abundance and visualize volcano plot
+```{r}
+mat <- model.matrix(~ 0 + pData(x)$Sample)
+colnames(mat) <- c('mated','unmated')
+pData(x)$cmat <- mat
+
+
+##Functions
+dostatsmated_unmated <- function(x) {
+  cont.matrix <- makeContrasts(DE    = mated - unmated,
+                               levels   = pData(x)[, "cmat"])
+  fit <- lmFit(exprs(x), pData(x)[, "cmat"])
+  fit2 <- contrasts.fit(fit, cont.matrix)
+  fit2 <- eBayes(fit2)
+  tt1 <- topTable(fit2, adjust.method = "BH", coef = "DE", number = Inf)
+  return(tt1)
+}
+
+# Mated vs unmated
+res_mated_unmated <- dostatsmated_unmated(x)
+fData(x)$DE_mated_unmated <- res_mated_unmated[featureNames(x), ]
+
+dfr_mated_unmated <- data.frame(Desc = fData(x)$Desc,
+                  round(exprs(x),2),
+                  log2_FC = fData(x)$DE_mated_unmated[, "logFC"],
+                  adj.P.Val = fData(x)$DE_mated_unmated[, "adj.P.Val"])
+
+#tiff('Egg.Mascot.DA.tiff', units="in", width=3.5, height=4.25, res=300)
+ggplot(dfr_mated_unmated, aes(x=log2_FC, y=-log10(adj.P.Val)))+
+    geom_hline(yintercept= -log10(0.05), lty=2, cex=0.5, col="black")+
+  geom_point(pch=21,cex = 1.75, bg= ifelse(dfr_mated_unmated$adj.P.Val < 0.05 & dfr_mated_unmated$log2_FC > 0, "purple", ifelse(dfr_mated_unmated$adj.P.Val < 0.05 & dfr_mated_unmated$log2_FC < 0, "#eaa221", "gray80")), col="black", alpha= ifelse(dfr_mated_unmated$adj.P.Val < 0.05, 0.8, 0.6))+
+  theme_classic()+
+  ylab("-Log10 Adjusted p-value")+
+  xlab("Log2 Abundance Difference")+
+  xlim(c(-2.5,2.5))
+#dev.off()
+```
+
+Analyze & visualize relationship between PCA loading values with differences in abundance
+```{r}
+pca.egg <- pca$rotation
+pca.egg <- as.data.frame(pca.egg)
+
+pca.egg <- full_join(rownames_to_column(pca.egg), rownames_to_column(res_mated_unmated ), by="rowname")
+
+#tiff('Egg.Mascot.PCA.tiff', units="in", width=3.5, height=2.5, res=300)
+ggplot(pca.egg, aes(x=PC1, y=logFC))+
+  geom_point(pch=21,cex = 1.75, bg= ifelse(pca.egg$adj.P.Val < 0.05 & pca.egg$logFC > 0, "purple", ifelse(pca.egg$adj.P.Val < 0.05 & pca.egg$logFC < 0, "#eaa221", "gray80")), col="black", alpha= ifelse(pca.egg$adj.P.Val < 0.05, 0.9, 0.6))+
+  geom_smooth(method=lm, se=T, col="black", lty=2)+
+  theme_classic()+
+  ylab("Log2 Abundance Difference")+
+  xlab("PC 1 Protein Rotation Value")+
+  ylim(c(-2.5,2.5))
+
+#dev.off()
+
+round(summary(lm(PC1 ~ logFC, data=pca.egg))$r.squared, 2)
+lmp(lm(PC1 ~ logFC, data=pca.egg))
+
+```
+
+Look at what proteins are differentially abundant
+Analyze whether the number of proteins is different between oocytes from mated females and unmated females
+```{r}
+res_mated_unmated$fbgn <- rownames(res_mated_unmated)
+res_mated_unmated <- right_join(convert, res_mated_unmated, by=c("primary_FBgn" = "fbgn"))
+
+length(which(res_mated_unmated$adj.P.Val < 0.05))
+
+length(which(res_mated_unmated$adj.P.Val < 0.05 & res_mated_unmated$logFC > 0)) #296
+length(which(res_mated_unmated$adj.P.Val < 0.05 & res_mated_unmated$logFC > 0)) / length(which(res_mated_unmated$adj.P.Val < 0.05)) #60%
+
+length(which(res_mated_unmated$adj.P.Val < 0.05 & res_mated_unmated$logFC < 0)) #200
+length(which(res_mated_unmated$adj.P.Val < 0.05 & res_mated_unmated$logFC < 0)) / length(which(res_mated_unmated$adj.P.Val < 0.05)) #40%
+
+binom.test(x=296,n=496,p=1/2) #p < 0.001 there are more upregulated than would be expected
+```
+
+Save files/lists of differentially abundant proteins and the analyzed data in table S1
+```{r}
+#Greater in mated
+write.table(subset(res_mated_unmated$primary_FBgn, res_mated_unmated$adj.P.Val < 0.05& res_mated_unmated$logFC > 0), "egg.mated.DElist.txt", col.names=F, row.names=F, quote=F)
+
+#Greater in unmated
+write.table(subset(res_mated_unmated$primary_FBgn, res_mated_unmated$adj.P.Val < 0.05& res_mated_unmated$logFC < 0), "egg.unmated.DElist.txt", col.names=F, row.names=F, quote=F)
+
+#All proteins
+write.table(res_mated_unmated$primary_FBgn, "egg.mascot.background.txt", col.names=F, row.names=F, quote=F)
+
+#Analyzed data
+egg.mascot.abd <- egg.mascot[,c(5,19, 20,22,21,23,24)]
+mascot.analyzed.egg <- full_join(res_mated_unmated, egg.mascot.abd, by=c("primary_FBgn" = "Accession"))
+write.table(mascot.analyzed.egg, "mascot.analyzed.egg.txt", col.names = T, row.names = F)
+
+#Top 10% most abundant proteins
+mascot.top10 <- mascot.analyzed.egg[mascot.analyzed.egg$AveExpr > quantile(mascot.analyzed.egg$AveExpr, prob=1-10/100),]
+
+write.table(mascot.top10$primary_FBgn, "Oocyte.Top10percent.txt", col.names = F, row.names = F, quote = F)
+```
+
+Analyze differences in abundance changes between oocytes from mated females and unmated females
+```{r}
+mascot.analyzed.egg$DA <- ifelse(mascot.analyzed.egg$adj.P.Val <0.05 & mascot.analyzed.egg$logFC<0, "Unmated", ifelse(mascot.analyzed.egg$adj.P.Val <0.05 & mascot.analyzed.egg$logFC>0, "Mated", "NoChange"))
+
+mascot.analyzed.egg$DA <- factor(mascot.analyzed.egg$DA, levels=c("NoChange", "Unmated", "Mated"))
+
+#tiff('Egg.logFC.tiff', units="in", width=3.5, height=3.5, res=300)
+ggplot(data = subset(mascot.analyzed.egg, mascot.analyzed.egg$DA != "NoChange"), aes(x = DA, y = abs(logFC), fill= DA))+
+    geom_boxplot(outlier.color = NA)+
+    scale_fill_manual(values=c("#eaa221", "purple"))+
+    geom_jitter(pch=21, alpha=0.35, fill="white", position=position_jitter(width=.3), cex=0.8)+
+    labs(y="Absolute Log2 Abundance Difference", x="")+
+    scale_x_discrete( labels = c('Unmated\nFemale', 'Mated\nFemale'))+
+    theme_classic()+
+   theme(legend.position = "none")
+
+kruskal.test(logFC ~ DA, data= subset(mascot.analyzed.egg, mascot.analyzed.egg$adj.P.Val < 0.05)) # p < 0.001
+
+mascot.sum <- mascot.analyzed.egg %>%
+  dplyr::group_by(DA) %>%
+  dplyr::summarise(count=n(),mean= mean(abs(logFC)), sd = sd(logFC))
+mascot.sum$se <- mascot.sum$sd / sqrt(mascot.sum$count)
+```
+
+Compare to follicle cell proteins (Zhang 2019 and Kronja 2014) to see if those are contributing dispraportianetly to the differences observed
+```{r}
+Follicle_cell_proteins = c("FBgn0035026", "FBgn0000644", "FBgn0000427", "FBgn0032788", "FBgn0038469", "FBgn0051928", "FBgn0029568", "FBgn0029979", "FBgn0029980", "FBgn0032727", "FBgn0052642", "FBgn0022774", "FBgn0002641", "FBgn0004649", "FBgn0004649", "FBgn0005391", "FBgn0035328", "FBgn0041709", "FBgn0029979", "FBgn0031913", "FBgn0032727", "FBgn0032897", "FBgn0035768", "FBgn0038611", "FBgn0041252", "FBgn0085446", "FBgn0000355", "FBgn0000356", "FBgn0000357", "FBgn0000358", "FBgn0000359", "FBgn0000360", "FBgn0014464", "FBgn0014465", "FBgn0014466", "FBgn0261987") #36
+
+Kronja.follicle.notused <- read.table("kronja.follicle.validated.txt", header=F)
+Kronja.follicle.notused <- unique(Kronja.follicle.notused) #42
+Kronja.follicle.notused$V1 <- as.character(Kronja.follicle.notused$V1)
+
+follicle.all <- unique(c(Kronja.follicle.notused$V1, Follicle_cell_proteins)) #47
+
+#Identification of follicle proteins in our full oocyte proteome
+length(which(follicle.all %in% mascot.analyzed.egg$primary_FBgn)) #40
+40/47
+
+#Proportion of our oocyte proteome
+40/4485 * length(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05))
+
+#Follicle proteins with greater abundance in oocyte from mated female
+length(which(follicle.all %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC > 0))) #3
+
+#Follicle proteins with greater abundance in oocyte from unmated female
+length(which(follicle.all %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC < 0))) #2
+
+#Calculate proportion of all proteins that are differentiall abundant
+#And calculate how that compares to expectations
+length(which(follicle.all %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05))) #5
+
+binom.test(x=5, n=496, p=40/4485) #0.6
+40/4485
+
+#save data frame for Table S1
+follicle.all <- data.frame(follicle.all)
+follicle.all$FemaleMatingStatusOocyteProteome <- ifelse (follicle.all$follicle.all %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC > 0), "Mated", ifelse (follicle.all$follicle.all %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC < 0), "Unmated", ifelse(follicle.all$follicle.all %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val > 0.05), "NoChange", "NotIdentified")))
+follicle.all <- left_join(follicle.all, convert, by=c( "follicle.all" = "primary_FBgn"))
+
+write.table(follicle.all, "follicle.all.txt", quote=F,col.names=T, row.names=F)
+```
+
+Compare to translational aging data to see if oocyte aging contributes to differences in oocyte proteome - Greenblatt et al. 2019
+The main focus is genes that decrease in translational efficiency (> 50% of genes)
+Visualize overlap and save for Table S1
+```{r}
+TranslationAging <- read.table("TranslationAging.S1.Greenblat.txt", header=T, sep="\t", quote = "", row.names = NULL, stringsAsFactors = FALSE)
+
+TranslationAging <- TranslationAging[!is.na(TranslationAging$ttest.12.vs..2.RPFs),]
+
+length(which(TranslationAging$Flybase.ID %in% mascot.analyzed.egg$primary_FBgn)) #4214
+length(which(TranslationAging$Flybase.ID %in% mascot.analyzed.egg$primary_FBgn))/ length(mascot.analyzed.egg$primary_FBgn) #94.0%
+
+TranslationAging$MatDat <- ifelse(TranslationAging$Flybase.ID %in% subset(res_mated_unmated$primary_FBgn, res_mated_unmated$adj.P.Val < 0.05& res_mated_unmated$logFC > 0), "Up", ifelse( TranslationAging$Flybase.ID %in% subset(res_mated_unmated$primary_FBgn, res_mated_unmated$adj.P.Val < 0.05& res_mated_unmated$logFC < 0), "Down", ifelse(TranslationAging$Flybase.ID %in% subset(res_mated_unmated$primary_FBgn, res_mated_unmated$adj.P.Val >= 0.05), "NoChange", NA)))
+
+#Total number of proteins with decrease in TE
+length(subset(TranslationAging$Flybase.ID, TranslationAging$ttest.12.vs..2.RPFs < 0.05 & TranslationAging$fold.change.12.2.RPFs < 1)) #2644
+
+#Total number of proteins with decrease in TE and are in our oocyte proteome
+length(which(subset(TranslationAging$Flybase.ID, TranslationAging$ttest.12.vs..2.RPFs < 0.05 & TranslationAging$fold.change.12.2.RPFs < 1) %in% mascot.analyzed.egg$primary_FBgn)) #2168
+
+2644/ length(TranslationAging$Flybase.ID)
+2168/length(which(TranslationAging$Flybase.ID %in% mascot.analyzed.egg$primary_FBgn))#4214
+
+#Overlap with greater abundance in oocytes from unmated females
+#genes identified by Greenblatt and have greater abundance in oocytes from unmated females
+length(which(TranslationAging$Flybase.ID %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC < 0))) #190
+
+#genes that also have decrease in TE
+length(subset(TranslationAging$Flybase.ID, TranslationAging$ttest.12.vs..2.RPFs < 0.05 & TranslationAging$fold.change.12.2.RPFs < 1 & TranslationAging$MatDat == "Down")) #118
+
+pbinom(118, size=190, prob=2168/4214, lower.tail=T) 
+2168/4214*190
+
+
+#Overlap with greater abundance in oocytes from mated females
+#genes identified by Greenblatt and have greater abundance in oocytes from unmated females
+length(which(TranslationAging$Flybase.ID %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC > 0))) #261
+
+#genes that also have decrease in TE
+length(subset(TranslationAging$Flybase.ID, TranslationAging$ttest.12.vs..2.RPFs < 0.05 & TranslationAging$fold.change.12.2.RPFs < 1 & TranslationAging$MatDat == "Up")) #94
+
+pbinom(94, size=261, prob=2168/4214, lower.tail=T) 
+2168/4214*261
+
+#visualize overlaps - euler diagram
+#tiff("TE5.tiff", units="in", width=3.5, height=3.5, res=300)
+plot(euler(c("A" = 296-94, "B" = 200-118, "C" = 2168 - 94 - 118,
+                "A&B" = 0, "A&C" = 94, "B&C" = 118,
+                "A&B&C" = 0)),
+     legend = list(side = "right"),
+     fill = "transparent", 
+     edges = c("purple", "#eaa221", "black"))
+
+#Save data on overlaps for Table S1
+TE.down <- subset(TranslationAging$Flybase.ID, TranslationAging$ttest.12.vs..2.RPFs < 0.05 & TranslationAging$fold.change.12.2.RPFs < 1)
+
+#alternative visualization of overlaps - histograms
+TE.obs <- data.frame(c(length(TranslationAging$Flybase.ID) - length(subset(TranslationAging$Flybase.ID, TranslationAging$ttest.12.vs..2.RPFs < 0.05 & TranslationAging$fold.change.12.2.RPFs <1)), length(subset(TranslationAging$Flybase.ID, TranslationAging$ttest.12.vs..2.RPFs < 0.05 & TranslationAging$fold.change.12.2.RPFs <1)), length(mascot.analyzed.egg$primary_FBgn) - length(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05)), length(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05))), c("Not", "TE.down", "Not", "DA"), c("TE","TE","OocyteMating","OocyteMating"))
+colnames(TE.obs) <- c("Number", "Change", "Data")
+
+TE.obs$Proportion <- TE.obs$Number / c(length(TranslationAging$Flybase.ID),length(TranslationAging$Flybase.ID), length(mascot.analyzed.egg$primary_FBgn), length(mascot.analyzed.egg$primary_FBgn))
+
+#proportion that changes
+tiff('ProportionSigDiff.tiff', units="in", width=3.5, height=3, res=300)
+ggplot(TE.obs, aes(x=Data, y=Number)) + 
+  geom_bar(stat="identity",fill=c(rep(c("white", "black"),2)), color = "black") + 
+  labs(x= "", y="Number of Proteins or Genes") +
+  scale_x_discrete( labels = c("Oocyte Proteome\nFemale Mating Status", "Translational Efficiency\nOocyte Aging"))+
+  theme_classic()+
+  theme(legend.position="none")
+#dev.off()
+
+TE.obs2 <- data.frame(c("Mated", "Unmated"),
+              c(94,118),
+              c((2168/4214)*261, (2168/4214)*190))
+colnames(TE.obs2) <- c("DA", "obs", "exp")
+TE.obs2$proportion <- TE.obs2$obs/TE.obs2$exp
+
+tiff('ObsExpOverlap.tiff', units="in", width=3.5, height=3, res=300)
+ggplot(TE.obs2, aes(x=DA, y=proportion)) + 
+  geom_hline(yintercept=1, col="black", lty=2)+
+  geom_bar(stat="identity",fill=c("purple", "#eaa221"), color = "black") + 
+  labs(x= "", y="Observed/Expected") +
+  #facet_wrap(~ maturation, strip.position="bottom", ncol=3)+
+  scale_x_discrete( labels = c('Mated\nFemale', 'Unmated\nFemale', 'Mated\nFemale', 'Unmated\nFemale'))+
+  theme_classic()+
+  theme(legend.position="none")
+#dev.off()
+
+
+TE.down <- data.frame(TE.down)
+TE.down$FemaleMatingStatusOocyteProteome <- ifelse (TE.down$TE.down %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC > 0), "Mated", ifelse (TE.down$TE.down %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC < 0), "Unmated", ifelse(TE.down$TE.down %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val > 0.05), "NoChange", "NotIdentified")))
+TE.down <- left_join(TE.down, convert, by=c( "TE.down" = "primary_FBgn"))
+
+write.table(TE.down, "TE.down.txt", quote=F,col.names=T, row.names=F)
+```
+
+Also want to look at the small number of genes that increase in TE there is only one that overlaps with proteins that change in differential abundance, not worth pursuing.
+```{r}
+length(subset(TranslationAging$Flybase.ID, TranslationAging$ttest.12.vs..2.RPFs < 0.05 & TranslationAging$fold.change.12.2.RPFs > 1)) #63
+
+2644/(2644+63)
+
+length(subset(TranslationAging$Flybase.ID, TranslationAging$ttest.12.vs..2.RPFs < 0.05 & TranslationAging$fold.change.12.2.RPFs > 1 & TranslationAging$MatDat == "Down")) #0
+
+length(subset(TranslationAging$Flybase.ID, TranslationAging$ttest.12.vs..2.RPFs < 0.05 & TranslationAging$fold.change.12.2.RPFs > 1 & TranslationAging$MatDat == "Up")) #1
+```
+
+Compare to maturation data from Kronja et al. 2014
+Look at correlation in how proteins change over maturation and with female mating status
+```{r}
+Mat.data <- read.table("Eggmat.Kronja2015.CGoriginal.Data.txt", sep="\t", fill = T, header=T)
+
+Mat.data <- inner_join(Kronja2015.FlyBase2.full, Mat.data, by = c("submitted_item" = "Symbol"))
+
+Mat.data$avg <- rowMeans(Mat.data[,c(5:7)], na.rm = T)
+Mat.data <- inner_join(Mat.data, mascot.analyzed.egg, by=c("validated_id" = "primary_FBgn"))
+
+Mat.data <- unique(Mat.data)
+
+write.table(Mat.data, "Mat.data.cor.txt", col.names = T, row.names = F, quote=F)
+
+#tiff("MaturationCorrelation.tiff", units="in", width=5, height=5, res=300)
+ggplot (Mat.data, aes(x = logFC, y = avg)) +
+   geom_hline(yintercept=0, col="black", lty=2)+
+  geom_vline(xintercept=0, col="black", lty=2)+
+   geom_point(pch=21, col=ifelse(Mat.data$validated_id %in% DownMat$validated_id, "red", ifelse(Mat.data$validated_id %in% UpMat$validated_id, "red3", "grey50")),
+             bg=ifelse(Mat.data$logFC > 0 & Mat.data$adj.P.Val < 0.05, "purple", ifelse(Mat.data$logFC < 0 & Mat.data$adj.P.Val < 0.05,"#eaa221", NA)), alpha=0.65)+
+  geom_smooth(method=lm, se=T, col="black")+
+  labs(y = "Oocyte maturation normalized ratio", x = "Log2 Abundance Difference") +
+  scale_y_continuous(limits=c(-5, 5), breaks=seq(-5,5, by=1))+
+  scale_x_continuous(limits=c(-2,2), breaks=seq(-2,2, by=0.5))+
+  theme_classic()
+
+summary(lm(Mat.data$logFC ~ Mat.data$avg))
+
+shapiro.test(Mat.data$logFC) # not normal
+shapiro.test(Mat.data$avg) # not normal
+
+
+cor(Mat.data$logFC, Mat.data$avg,  method = "spearman", use = "complete.obs")
+cor.test(Mat.data$logFC, Mat.data$avg,  method = "spearman", use = "complete.obs")
+
+cor.test(Mat.data$logFC, Mat.data$avg,  method = "pearson", use = "complete.obs")
+```
+
+Read in maturation and activation gene lists from Kronja et 2014
+```{r}
+NoneMatUpAct <- read.table("NoneMatUpAct.Kronja.txt", fill=T, header=T, row.names= NULL)
+NoneMatDownAct <- read.table("NoneMatDownAct.Kronja.txt", fill=T, header=T, row.names= NULL)
+UpMatUpAct <- read.table("UpMatUpAct.Kronja.txt", fill=T, header=T, row.names= NULL)
+UpMatUpAct <- UpMatUpAct[,c(2:4)]
+UpMatDownAct <- read.table("UpMatDownAct.Kronja.txt", fill=T, header=T, row.names= NULL)
+UpMatNoneAct <- read.table("UpMatNoneAct.Kronja.txt", fill=T, header=T, row.names= NULL)
+DownMatUpAct <- read.table("DownMatUpAct.Kronja.txt", fill=T, header=T, row.names= NULL)
+DownMatDownAct <- read.table("DownMatDownAct.Kronja.txt", fill=T, header=T, row.names= NULL)
+DownMatNoneAct <- read.table("DownMatNoneAct.Kronja.txt", fill=T, header=T, row.names= NULL)
+```
+
+Look at patterns with proteins that decrease in abundance over maturation
+```{r}
+DownMat <- rbind(DownMatDownAct, DownMatNoneAct, DownMatUpAct)
+
+#Total overlap of oocyte data with maturation data
+length(which(unique(Kronja2015.Identified) %in% mascot.analyzed.egg$primary_FBgn)) #3924
+
+#Overlap of porteins that go down during maturation and oocyte data
+length(which(unique(DownMat$validated_id) %in% mascot.analyzed.egg$primary_FBgn)) #375
+
+#save file on comparison with decrease in abundance for Table S1
+DownMat2 <- data.frame(DownMat)
+DownMat2$DA <- ifelse (DownMat2$validated_id %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC > 0), "Mated", ifelse (DownMat2$validated_id %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC < 0), "Unmated", ifelse(DownMat2$validated_id %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val > 0.05), "NoChange", "NotIdentified")))
+DownMat2 <- left_join(DownMat2, convert, by=c( "validated_id" = "primary_FBgn"))
+
+write.table(DownMat2, "DownMat2.txt", quote=F,col.names=T, row.names=F)
+
+#### Higher in oocytes from Mated females "UP" ####
+
+#Expected number of proteins that would be identified in higher in oocytes from mated females
+length(which(unique(DownMat$validated_id) %in% mascot.analyzed.egg$primary_FBgn))/ length(mascot.analyzed.egg$primary_FBgn) * length(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg $adj.P.Val <= 0.05)) #24.75
+
+#Observed overlap with higher in oocytes from mated females
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg $adj.P.Val <= 0.05) %in% unique(DownMat$validated_id))) #79
+
+#Save list of overlap to analyze
+write.table(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg $adj.P.Val <= 0.05 & mascot.analyzed.egg$primary_FBgn %in% unique(DownMat$validated_id)), "DownMat.Mated.txt", row.names=F, col.names=F, quote = F)
+
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% unique(Kronja2015.Identified))) #264
+
+pbinom(79, size = 264, prob = 375/3924, lower.tail = F)
+
+#### Higher in oocytes from UN mated females "Down" ####
+
+#Expected number of proteins that would be identified in higher in oocytes from unmated females
+length(which(unique(DownMat$validated_id) %in% mascot.analyzed.egg$primary_FBgn))/ length(mascot.analyzed.egg$primary_FBgn) * length(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg $adj.P.Val <= 0.05)) #16.72
+
+#Observed overlap with higher in oocytes from unmated females
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg $adj.P.Val <= 0.05) %in% unique(DownMat$validated_id))) #10
+
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% unique(Kronja2015.Identified))) #162
+
+pbinom(10, size = 162, prob = 375/3924, lower.tail = F)
+pbinom(10, size = 162, prob = 375/3924, lower.tail = T)
+```
+
+Look at patterns with proteins that increase in abundance over maturation
+```{r}
+UpMat <- rbind(UpMatDownAct, UpMatNoneAct, UpMatUpAct)
+
+#Total overlap of oocyte data with maturation data
+length(which(unique(Kronja2015.Identified) %in% mascot.analyzed.egg$primary_FBgn)) #3924
+
+#Overlap of porteins that go down during maturation and oocyte data
+length(which(unique(UpMat$validated_id) %in% mascot.analyzed.egg$primary_FBgn)) #477
+
+#save file on comparison with decrease in abundance for Table S1
+UpMat2 <- data.frame(UpMat)
+UpMat2$DA <- ifelse (UpMat2$validated_id %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC > 0), "Mated", ifelse (UpMat2$validated_id %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC < 0), "Unmated", ifelse(UpMat2$validated_id %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val > 0.05), "NoChange", "NotIdentified")))
+UpMat2 <- left_join(UpMat2, convert, by=c( "validated_id" = "primary_FBgn"))
+
+write.table(UpMat2, "UpMat2.txt", quote=F,col.names=T, row.names=F)
+
+#### Higher in oocytes from Mated females "UP" ####
+
+#Expected number of proteins that would be identified in higher in oocytes from mated females
+length(which(unique(UpMat$validated_id) %in% mascot.analyzed.egg$primary_FBgn))/ length(mascot.analyzed.egg$primary_FBgn) * length(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg $adj.P.Val <= 0.05)) #31.48
+
+#Observed overlap with higher in oocytes from mated females
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg $adj.P.Val <= 0.05) %in% unique(UpMat$validated_id))) #6
+
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% unique(Kronja2015.Identified))) #264
+
+pbinom(6, size = 264, prob = 477/3924, lower.tail = T) # p < 0.001
+
+#### Higher in oocytes from UN mated females "Up" ####
+
+#Expected number of proteins that would be identified in higher in oocytes from unmated females
+length(which(unique(UpMat$validated_id) %in% mascot.analyzed.egg$primary_FBgn))/ length(mascot.analyzed.egg$primary_FBgn) * length(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg $adj.P.Val <= 0.05)) #21.27
+
+#Observed overlap with higher in oocytes from unmated females
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg $adj.P.Val <= 0.05) %in% unique(UpMat$validated_id))) #32
+
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% unique(Kronja2015.Identified))) #162
+
+pbinom(32, size = 162, prob = 477/3924, lower.tail = F) # p = 0.002
+```
+
+Make figure related to observed and expected changes with respect to maturation
+```{r}
+Mat.data <- data.frame(
+c("Stage 11", "Stage 11", "Stage 14", "Stage 14"), 
+c("Mated Female", "Unmated Female", "Mated Female", "Unmated Female"),
+c(length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg $adj.P.Val <= 0.05) %in% unique(DownMat$validated_id))),
+  length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg $adj.P.Val <= 0.05) %in% unique(DownMat$validated_id))),
+  length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg $adj.P.Val <= 0.05) %in% unique(UpMat$validated_id))),
+  length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg $adj.P.Val <= 0.05) %in% unique(UpMat$validated_id)))),
+c(length(which(unique(DownMat$validated_id) %in% mascot.analyzed.egg$primary_FBgn)),
+    length(which(unique(DownMat$validated_id) %in% mascot.analyzed.egg$primary_FBgn)),
+    length(which(unique(UpMat$validated_id) %in% mascot.analyzed.egg$primary_FBgn)),
+    length(which(unique(UpMat$validated_id) %in% mascot.analyzed.egg$primary_FBgn))),
+c(rep(length(which(unique(Kronja2015.Identified) %in% mascot.analyzed.egg$primary_FBgn)),4)),
+c(length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% unique(Kronja2015.Identified))),
+  length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% unique(Kronja2015.Identified))),
+  length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% unique(Kronja2015.Identified))),
+  length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% unique(Kronja2015.Identified)))))  
+  
+colnames(Mat.data) <- c("maturation", "mating","Obs", "Maturation.overlap", "All.overlap", "Mating.overlap")
+
+Mat.data$expected <- (Mat.data$Maturation.overlap / Mat.data$All.overlap) *Mat.data$Mating.overlap
+Mat.data$obsexp <- Mat.data$Obs/ Mat.data$expected
+
+
+#tiff('Maturation.tiff', units="in", width=3.5, height=3, res=300)
+ggplot(Mat.data, aes(x=mating, y=obsexp)) + 
+  geom_bar(stat="identity", fill=c(rep(c("purple", "#eaa221"),2)), color = "black") + 
+  #scale_fill_manual(values=c("purple", "#eaa221"))+ 
+  geom_hline(yintercept = 1, linetype = 2, col= "black") + 
+  labs(x= "Maturation", y="Observed/Expected") +
+  facet_wrap(~ maturation, strip.position="bottom", ncol=3)+
+  scale_x_discrete( labels = c('Mated\nFemale', 'Unmated\nFemale', 'Mated\nFemale', 'Unmated\nFemale'))+
+  theme_classic()+
+  theme(legend.position="none")
+#dev.off()
+
+```
+
+Analyze overlap with activation data - decrease following activation
+```{r}
+#Total overlap of Kronja activation data with our oocyte proteome
+length(which(egg.mascot$Accession %in% Kronja2014.Identified)) #3984
+
+
+#Proteins that decrease following activation
+DownAct <- rbind(DownMatDownAct, UpMatDownAct, NoneMatDownAct)
+
+#Proteins that decrease following activation that are in our data set
+length(which(unique(DownAct$validated_id) %in% mascot.analyzed.egg$primary_FBgn)) #283
+
+#Save data for Table S1
+DownAct2 <- data.frame(DownAct)
+DownAct2$DA <- ifelse (DownAct2$validated_id %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC > 0), "Mated", ifelse (DownAct2$validated_id %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC < 0), "Unmated", ifelse(DownAct2$validated_id %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val > 0.05), "NoChange", "NotIdentified")))
+DownAct2 <- left_join(DownAct2, convert, by=c( "validated_id" = "primary_FBgn"))
+write.table(DownAct2, "DownAct2.txt", quote=F,col.names=T, row.names=F)
+
+## More abundant in oocytes from mated females "UP" ##
+#Proteins that are greater in mated female and are in the Kronja activation data
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% Kronja2014.Identified)) #251
+
+#Proteins that are greater in mated female and decrease following activation
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg $adj.P.Val <= 0.05) %in% DownAct$validated_id)) #34
+
+pbinom(34, size = 251, prob = 283/3984, lower.tail = F) # significant more than expected
+
+## More abundant in oocytes from unmated females "Down" ##
+#Proteins that are greater in unmated female and are in the Kronja activation data
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% Kronja2014.Identified)) #170
+
+#Proteins that are greater in mated female and decrease following activation
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg $adj.P.Val <= 0.05) %in% DownAct$validated_id)) #10
+
+pbinom(10, size = 170, prob = 283/3984, lower.tail = F)
+pbinom(10, size = 170, prob = 283/3984, lower.tail = T)
+```
+
+
+Analyze overlap with activation data - decrease following activation
+```{r}
+#Proteins that increase following activation
+UpAct <- rbind(DownMatUpAct, UpMatUpAct, NoneMatUpAct)
+
+#Proteins that decrease following activation that are in our data set
+length(which(UpAct$validated_id %in% mascot.analyzed.egg$primary_FBgn)) #128
+
+#Save data for Table S1
+UpAct2 <- data.frame(UpAct)
+UpAct2$DA <- ifelse (UpAct2$validated_id %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC > 0), "Mated", ifelse (UpAct2$validated_id %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC < 0), "Unmated", ifelse(UpAct2$validated_id %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val > 0.05), "NoChange", "NotIdentified")))
+UpAct2 <- left_join(UpAct2, convert, by=c( "validated_id" = "primary_FBgn"))
+write.table(UpAct2, "UpAct2.txt", quote=F,col.names=T, row.names=F)
+
+## More abundant in oocytes from mated females "UP" ##
+#Proteins that are greater in mated female and are in the Kronja activation data
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% Kronja2014.Identified)) #251
+
+#Proteins that are greater in mated female and decrease following activation
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg $adj.P.Val <= 0.05) %in% UpAct$validated_id)) #6
+
+pbinom(6, size = 251, prob = 128/3984, lower.tail = F)
+pbinom(6, size = 251, prob = 128/3984, lower.tail = T)
+
+## More abundant in oocytes from unmated females "down" ##
+#Proteins that are greater in unmated female and are in the Kronja activation data
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% Kronja2014.Identified)) #170
+
+#Proteins that are greater in unmated female and decrease following activation
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg $adj.P.Val <= 0.05) %in% UpAct$validated_id)) #6
+
+pbinom(6, size = 170, prob = 128/3984, lower.tail = F)
+
+```
+
+Make figure related to observed and expected changes with respect to activation
+```{r}
+#Pull together data to analyze
+Act.data <- data.frame(
+c(length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg $adj.P.Val <= 0.05) %in% unique(DownAct$validated_id))), length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg $adj.P.Val <= 0.05) %in% unique(DownAct$validated_id))), length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg $adj.P.Val <= 0.05) %in% unique(UpAct$validated_id))), length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg $adj.P.Val <= 0.05) %in% unique(UpAct$validated_id)))),
+  
+c(length(which(unique(DownAct$validated_id) %in% mascot.analyzed.egg$primary_FBgn)), 
+    length(which(unique(DownAct$validated_id) %in% mascot.analyzed.egg$primary_FBgn)),
+    length(which(unique(UpAct$validated_id) %in% mascot.analyzed.egg$primary_FBgn)),
+    length(which(unique(UpAct$validated_id) %in% mascot.analyzed.egg$primary_FBgn))),
+
+c(rep(length(which(egg.mascot$Accession %in% Kronja2014.Identified)),4)),
+  
+c( length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% Kronja2014.Identified)),
+   length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg $adj.P.Val <= 0.05) %in% Kronja2014.Identified)),
+   length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg $adj.P.Val <= 0.05) %in% Kronja2014.Identified)),
+    length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg $adj.P.Val <= 0.05) %in% Kronja2014.Identified))),
+c("Not Activated", "Not Activated", "Activated", "Activated"), c("Mated Female", "Unmated Female", "Mated Female", "Unmated Female"))
+
+colnames(Act.data) <- c("Obs", "Maturation.overlap", "All.overlap", "Mating.overlap", "activation", "mating")
+
+Act.data$expected <- (Act.data$Maturation.overlap / Act.data$All.overlap) *Act.data$Mating.overlap
+Act.data$obsexp <- Act.data$Obs/ Act.data$expected
+
+Act.data$activation <- factor(Act.data$activation, levels=c("Not Activated", "Activated"))
+
+#tiff('Activation.tiff', units="in", width=3.5, height=3, res=300)
+ggplot(Act.data, aes(x=mating, y=obsexp)) + 
+  geom_bar(stat="identity", fill=c(rep(c("purple", "#eaa221"),2)), color = "black") + 
+  geom_hline(yintercept = 1, linetype = 2, col= "black") + 
+  labs(x= "Activation", y="Observed/Expected") +
+  facet_wrap(~ activation, strip.position="bottom", ncol=3)+
+  scale_x_discrete( labels = c('Mated\nFemale', 'Unmated\nFemale', 'Mated\nFemale', 'Unmated\nFemale'))+
+  ylim(c(0,3))+
+  theme_classic()+
+  theme(legend.position="none")
+#dev.off()
+```
+
+Compare to changes in protein abundance following activation of phosphoproteins
+From Zhang et al. data from Yasir Ahmed-Braimah Github
+Starting with phosphoproteins that increase following activation
+```{r}
+Phosphoproteome <- read.table("phosphoproteome_comparison_Egg_vs_Oocyte_limma_results.txt", header=T, sep="\t", quote = "", row.names = NULL, stringsAsFactors = FALSE)
+
+Phosphoproteome$Ensembl.Gene.ID <- as.character(Phosphoproteome$Ensembl.Gene.ID)
+
+#Overlap of phospoproteome with our oocyte proteome
+length(which(Phosphoproteome$Ensembl.Gene.ID %in% mascot.analyzed.egg$primary_FBgn)) #3696
+
+#Save dataframe of overlap for Table S1
+Phospho.EggAct <- unique(subset(Phosphoproteome$Ensembl.Gene.ID, Phosphoproteome$log2FC > 0 & Phosphoproteome$sig == "YES"))
+
+Phospho.EggAct2 <- data.frame(Phospho.EggAct)
+Phospho.EggAct2$FemaleMatingStatusOocyteProteome <- ifelse (Phospho.EggAct2$Phospho.EggAct %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC > 0), "Mated", ifelse (Phospho.EggAct2$Phospho.EggAct %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC < 0), "Unmated", ifelse(Phospho.EggAct2$Phospho.EggAct %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val > 0.05), "NoChange", "NotIdentified")))
+Phospho.EggAct2 <- left_join(Phospho.EggAct2, convert, by=c( "Phospho.EggAct" = "primary_FBgn"))
+write.table(Phospho.EggAct2, "PhosphoEggAct.txt", col.names = T, row.names = F, quote= F)
+
+#Overlap of phosphoproteome that increase following activation with our oocyte proteome
+length(which(Phospho.EggAct %in% mascot.analyzed.egg$primary_FBgn)) # 205
+
+##Greater abundance in mated females##
+#Overlap of phospoproteome with proteins that have greater abundance in mated females
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% Phosphoproteome$Ensembl.Gene.ID)) # 223
+
+length(which(Phospho.EggAct %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC > 0))) # 49
+
+pbinom(49, size = 223, prob = 205/3696, lower.tail = F) 
+205/3696*296
+
+##Greater abundance in unmated females##
+#Overlap of phospoproteome with proteins that have greater abundance in unmated females
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% Phosphoproteome$Ensembl.Gene.ID)) # 150
+
+length(which(Phospho.EggAct %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC < 0))) # 5
+
+pbinom(5, size = 150, prob = 205/3696, lower.tail = T) 
+205/3696*200
+```
+
+Next analyze phosphoproteins that decrease following activation
+```{r}
+Phospho.Oocyte <- unique(subset(Phosphoproteome$Ensembl.Gene.ID, Phosphoproteome$log2FC < 0 & Phosphoproteome$sig == "YES"))
+
+#Save dataframe of overlap for Table S1
+Phospho.Oocyte2 <- data.frame(Phospho.Oocyte)
+Phospho.Oocyte2$FemaleMatingStatusOocyteProteome <- ifelse (Phospho.Oocyte2$Phospho.Oocyte %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC > 0), "Mated", ifelse (Phospho.Oocyte2$Phospho.Oocyte %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC < 0), "Unmated", ifelse(Phospho.Oocyte2$Phospho.Oocyte %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val > 0.05), "NoChange", "NotIdentified")))
+Phospho.Oocyte2 <- left_join(Phospho.Oocyte2, convert, by=c( "Phospho.Oocyte" = "primary_FBgn"))
+write.table(Phospho.Oocyte2, "PhosphoOocyte.txt", col.names = T, row.names = F, quote= F, sep=",")
+
+#Overlap of phosphoproteome that decrease following activation with our oocyte proteome
+length(which(Phospho.Oocyte %in% mascot.analyzed.egg$primary_FBgn)) #90
+
+##Greater abundance in mated females##
+#Overlap of phospoproteome with proteins that have greater abundance in mated females
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% Phosphoproteome$Ensembl.Gene.ID)) # 223
+
+length(which(Phospho.Oocyte %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC > 0))) # 18
+
+pbinom(18, size = 223, prob = 90/3696, lower.tail = F) 
+90/3696*296
+
+##Greater abundance in unmated females##
+#Overlap of phospoproteome with proteins that have greater abundance in unmated females
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% Phosphoproteome$Ensembl.Gene.ID)) # 150
+
+length(which(Phospho.Oocyte %in% subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$adj.P.Val < 0.05 & mascot.analyzed.egg$logFC < 0))) # 6
+pbinom(6, size = 150, prob = 90/3696, lower.tail = F) 
+
+#Visualize data analysis
+phosact.dat <- data.frame(c(49/(205/3696*223),
+                 5/(205/3696*150),
+                 18/(90/3696*223),
+                 6/(90/3696*150)),
+c("Mated","Unmated", "Mated", "Unmated"),
+c("Activated", "Activated", "Not Activated", "Not Activated"))
+colnames(phosact.dat) <- c("obsexp", "mating", "activation")
+
+phosact.dat$activation <- factor(phosact.dat$activation, levels=c("Not Activated", "Activated"))
+
+tiff('phosphoactivation.tiff', units="in", width=3.5, height=3, res=300)
+ggplot(phosact.dat, aes(x=mating, y=obsexp)) + 
+  geom_bar(stat="identity", fill=c(rep(c("purple", "#eaa221"),2)), color = "black") + 
+  geom_hline(yintercept = 1, linetype = 2, col= "black") + 
+  labs(x= "Activation", y="Observed/Expected") +
+  facet_wrap(~ activation, strip.position="bottom", ncol=3)+
+  scale_x_discrete( labels = c('Mated\nFemale', 'Unmated\nFemale', 'Mated\nFemale', 'Unmated\nFemale'))+
+  theme_classic()+
+  theme(legend.position="none")
+#dev.off()
+```
+
+Compare to proteins with functional phosphorylation changes
+```{r}
+Zhang.EggProteinPheno <- read.table("ZhangGenetics.Table S1.PhenoClass.txt", header=T, sep="\t")
+Zhang.convert <- read.table("ZhangGenetics.Table S1.GeneName.Converted.txt", header=T, sep="\t")
+Zhang.EggProteinPheno <- full_join(Zhang.EggProteinPheno, Zhang.convert, by=c("CG.number" = "submitted_item"))
+
+Zhang.EggProteinPheno <- unique(Zhang.EggProteinPheno)
+duplicated(Zhang.EggProteinPheno$CG.number)
+Zhang.EggProteinPheno <- Zhang.EggProteinPheno[c(1:190),]
+Zhang.EggProteinPheno <- Zhang.EggProteinPheno[-161,]
+
+length(Zhang.EggProteinPheno$validated_id) #189
+length(which(Zhang.EggProteinPheno$validated_id %in% mascot.analyzed.egg$primary_FBgn)) #148
+length(which(Zhang.EggProteinPheno$validated_id %in% mascot.analyzed.egg$primary_FBgn)) / length(Zhang.EggProteinPheno$validated_id)
+
+Zhang.EggProteinPheno$MatDat <- ifelse(Zhang.EggProteinPheno$validated_id %in% subset(res_mated_unmated$primary_FBgn, res_mated_unmated$adj.P.Val < 0.05& res_mated_unmated$logFC > 0), "Up", ifelse( Zhang.EggProteinPheno$validated_id %in% subset(res_mated_unmated$primary_FBgn, res_mated_unmated$adj.P.Val < 0.05& res_mated_unmated$logFC < 0), "Down", ifelse(Zhang.EggProteinPheno$validated_id %in% subset(res_mated_unmated$primary_FBgn, res_mated_unmated$adj.P.Val >= 0.05), "NoChange", NA)))
+
+length(subset(Zhang.EggProteinPheno$validated_id, Zhang.EggProteinPheno$phenotype.class != "Class 1" & (Zhang.EggProteinPheno$MatDat == "Up" | Zhang.EggProteinPheno$MatDat == "Down"))) #8
+length(subset(Zhang.EggProteinPheno$validated_id, Zhang.EggProteinPheno$phenotype.class != "Class 1" & (Zhang.EggProteinPheno$MatDat == "Up" | Zhang.EggProteinPheno$MatDat == "Down"))) / length(which(Zhang.EggProteinPheno$validated_id %in% mascot.analyzed.egg$primary_FBgn))
+```
+
+Provisional - comparison to phosphophorylation state
+Not much overlap
+```{r}
+
+phospho1 <- read.table("phosphoproteome_MSA_comparison_Egg_vs_Oocyte_significant_limma_results.txt", sep="\t", header=T, fill=T)
+
+phospho1 <- subset(phospho1, phospho1$comp2 == "Control")
+
+phospho2 <- read.table("phosphoproteome_NL_comparison_Egg_vs_Oocyte_significant_limma_results.txt", sep="\t", header=T, fill=T)
+
+phospho2 <- subset(phospho2, phospho2$comp2 == "Control")
+
+
+phospho.up <- as.vector(unique(subset(phospho1$Ensembl.Gene.ID, phospho1$log2FC > 0) , subset(phospho2$Ensembl.Gene.ID, phospho2$log2FC > 0)))
+
+phospho.up <- grep("FBgn", phospho.up, value=T) #87 proteins
+
+phospho.down <- as.vector(unique(subset(phospho1$Ensembl.Gene.ID, phospho1$log2FC < 0) , subset(phospho2$Ensembl.Gene.ID, phospho2$log2FC < 0)))
+
+phospho.down <- grep("FBgn", phospho.down, value=T) #149 proteins
+
+
+length(which(phospho.up %in% phospho.down)) #21
+
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% phospho.up)) #4
+
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC > 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% phospho.down)) #3 one of these is same as up
+
+
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% phospho.up)) #3
+
+length(which(subset(mascot.analyzed.egg$primary_FBgn, mascot.analyzed.egg$logFC < 0 & mascot.analyzed.egg$adj.P.Val < 0.05) %in% phospho.down)) #3 one of these is the same as up
+```
+
+
