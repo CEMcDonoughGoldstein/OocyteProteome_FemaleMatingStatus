@@ -8,7 +8,9 @@ Ooyctes were collected from either unmated females or females mated 24 hrs after
 We robustly identified 4,485 oocyte proteins and revealed that stage-14 oocytes from mated females differed significantly in protein composition relative to oocytes from unmated females, with 296 proteins more abundant in oocytes from mated females and 200 more abundant in oocytes from unmated females.
 Differentially abundant proteins in mated females formed a highly interconnected network enriched for translational machinery and transmembrane proteins were increased in oocytes , including calcium binding and transport proteins.
 
-We compared mating influences on the oocyte proteome with eisting data on decrease in translational efficiency (Greenblatt et al. 2019) changes in oocyte proteome during maturation (stage 11 to stage 14; Kronja et al. 2014a), activation (Kronja et al. 2014b), and changes during activation of phosphorylated proteins (Zhang et al. 2019).
+Raw data is available at ProteomeXchange PXD022142
+
+We compared mating influences on the oocyte proteome with eisting data on decrease in translational efficiency (Greenblatt et al. 2019) changes in oocyte proteome during maturation (stage 11 to stage 14; Kronja et al. 2014a), activation (Kronja et al. 2014b), and changes during activation of phosphorylated proteins (Zhang et al. 2019). All files involved in comparing to published data can be found in the folder /ComparisonsPublishedData 
 
 This repository includes all data and code necessary to replicate the analyses reproted in the manuscript.
 The code is found in "Analysis_code.rmd" and the oocyte proteome data is "P473_100619_Proteins.txt" all other files are for comparisons to other datasets.
